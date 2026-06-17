@@ -1,5 +1,7 @@
 import argparse
+import io
 import sys
+import zipfile
 from pathlib import Path
 
 from PIL import Image
@@ -132,6 +134,89 @@ def batch_convert(
     return results
 
 
+def _image_to_bytes(img: Image.Image, target_fmt: str, quality: int | None) -> bytes:
+    buf = io.BytesIO()
+    save_kwargs: dict = {"format": FORMAT_TO_PIL[target_fmt]}
+
+    if target_fmt in ("jpg", "webp"):
+        q = quality if quality is not None else DEFAULT_QUALITY[target_fmt]
+        if q is not None:
+            save_kwargs["quality"] = max(1, min(100, q))
+
+    if target_fmt == "png":
+        save_kwargs["optimize"] = True
+
+    if target_fmt == "jpg":
+        save_kwargs["subsampling"] = 0
+
+    img.save(buf, **save_kwargs)
+    return buf.getvalue()
+
+
+def batch_convert_to_zip(
+    input_paths: list[str | Path] | None = None,
+    input_dir: str | Path | None = None,
+    target_format: str = "png",
+    quality: int | None = None,
+    output_zip: str | Path | None = None,
+    recursive: bool = False,
+) -> Path:
+    target_fmt = _validate_format(target_format)
+
+    if input_paths is None and input_dir is None:
+        raise ValueError("Either input_paths or input_dir must be provided")
+
+    files: list[Path] = []
+    if input_paths is not None:
+        for p in input_paths:
+            path = Path(p)
+            if path.is_file():
+                files.append(path)
+
+    if input_dir is not None:
+        input_dir = Path(input_dir)
+        if not input_dir.is_dir():
+            raise NotADirectoryError(f"Not a directory: {input_dir}")
+        src_exts = {f".{f}" for f in SUPPORTED_FORMATS if f != target_fmt}
+        src_exts |= {".jpeg"} if target_fmt != "jpg" else set()
+        pattern = "**/*" if recursive else "*"
+        for f in input_dir.glob(pattern):
+            if f.is_file() and f.suffix.lower() in src_exts:
+                files.append(f)
+
+    if not files:
+        raise FileNotFoundError("No valid input images found")
+
+    if output_zip is None:
+        if input_dir is not None:
+            output_zip = Path(f"converted_{target_fmt}.zip")
+        else:
+            output_zip = Path(f"converted_{target_fmt}.zip")
+    else:
+        output_zip = Path(output_zip)
+
+    output_zip.parent.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        added: set[str] = set()
+        for f in files:
+            try:
+                with Image.open(f) as img:
+                    img = _prepare_image(img, target_fmt)
+                    data = _image_to_bytes(img, target_fmt, quality)
+
+                arcname = f.stem + f".{target_fmt}"
+                if arcname in added:
+                    arcname = f"{f.stem}_{f.parent.name}.{target_fmt}"
+                added.add(arcname)
+
+                zf.writestr(arcname, data)
+            except Exception as e:
+                print(f"[WARN] Failed to convert {f}: {e}", file=sys.stderr)
+
+    return output_zip
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Image format converter: PNG <-> JPG <-> WebP"
@@ -151,6 +236,13 @@ def main() -> None:
     p_batch.add_argument("-q", "--quality", type=int, default=None, help="Quality (1-100, for jpg/webp)")
     p_batch.add_argument("-r", "--recursive", action="store_true", help="Recurse into subdirectories")
 
+    p_zip = sub.add_parser("zip", help="Batch convert images and output as ZIP")
+    p_zip.add_argument("inputs", nargs="+", help="Input image files or directories")
+    p_zip.add_argument("-o", "--output", default=None, help="Output ZIP file path")
+    p_zip.add_argument("-f", "--format", required=True, dest="fmt", help="Target format: png/jpg/webp")
+    p_zip.add_argument("-q", "--quality", type=int, default=None, help="Quality (1-100, for jpg/webp)")
+    p_zip.add_argument("-r", "--recursive", action="store_true", help="Recurse into subdirectories")
+
     args = parser.parse_args()
 
     if args.command == "convert":
@@ -163,6 +255,49 @@ def main() -> None:
         print(f"Converted {len(results)} file(s)")
         for r in results:
             print(f"  {r}")
+    elif args.command == "zip":
+        file_paths: list[Path] = []
+        dirs: list[Path] = []
+        for item in args.inputs:
+            p = Path(item)
+            if p.is_file():
+                file_paths.append(p)
+            elif p.is_dir():
+                dirs.append(p)
+
+        zip_out = Path(args.output) if args.output else None
+
+        if dirs and not file_paths:
+            out_zip = batch_convert_to_zip(
+                input_dir=dirs[0],
+                target_format=args.fmt,
+                quality=args.quality,
+                output_zip=zip_out,
+                recursive=args.recursive,
+            )
+        elif dirs and file_paths:
+            all_files = file_paths[:]
+            for d in dirs:
+                src_exts = {f".{f}" for f in SUPPORTED_FORMATS if f != _validate_format(args.fmt)}
+                pattern = "**/*" if args.recursive else "*"
+                for f in d.glob(pattern):
+                    if f.is_file() and f.suffix.lower() in src_exts:
+                        all_files.append(f)
+            out_zip = batch_convert_to_zip(
+                input_paths=all_files,
+                target_format=args.fmt,
+                quality=args.quality,
+                output_zip=zip_out,
+            )
+        else:
+            out_zip = batch_convert_to_zip(
+                input_paths=file_paths,
+                target_format=args.fmt,
+                quality=args.quality,
+                output_zip=zip_out,
+            )
+
+        print(f"ZIP created -> {out_zip}")
 
 
 if __name__ == "__main__":
