@@ -30,11 +30,20 @@ def _validate_format(fmt: str) -> str:
     return fmt
 
 
+def _has_transparency(img: Image.Image) -> bool:
+    if img.mode in ("RGBA", "LA", "PA"):
+        return True
+    if img.mode == "P" and img.info.get("transparency") is not None:
+        return True
+    return False
+
+
 def _prepare_image(img: Image.Image, target_fmt: str) -> Image.Image:
     if target_fmt == "jpg":
-        if img.mode in ("RGBA", "LA", "PA"):
-            background = Image.new("RGB", img.size, (255, 255, 255))
-            background.paste(img, mask=img.split()[-1])
+        if _has_transparency(img):
+            rgba = img.convert("RGBA")
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.split()[-1])
             return background
         if img.mode != "RGB":
             return img.convert("RGB")
